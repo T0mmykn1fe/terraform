@@ -40,13 +40,18 @@ type ServiceProviderType string
 
 // List of available VCS types.
 const (
-	ServiceProviderBitbucket       ServiceProviderType = "bitbucket_hosted"
+	ServiceProviderAzureDevOpsServer   ServiceProviderType = "ado_server"
+	ServiceProviderAzureDevOpsServices ServiceProviderType = "ado_services"
+	ServiceProviderBitbucket           ServiceProviderType = "bitbucket_hosted"
+	// Bitbucket Server v5.4.0 and above
 	ServiceProviderBitbucketServer ServiceProviderType = "bitbucket_server"
-	ServiceProviderGithub          ServiceProviderType = "github"
-	ServiceProviderGithubEE        ServiceProviderType = "github_enterprise"
-	ServiceProviderGitlab          ServiceProviderType = "gitlab_hosted"
-	ServiceProviderGitlabCE        ServiceProviderType = "gitlab_community_edition"
-	ServiceProviderGitlabEE        ServiceProviderType = "gitlab_enterprise_edition"
+	// Bitbucket Server v5.3.0 and below
+	ServiceProviderBitbucketServerLegacy ServiceProviderType = "bitbucket_server_legacy"
+	ServiceProviderGithub                ServiceProviderType = "github"
+	ServiceProviderGithubEE              ServiceProviderType = "github_enterprise"
+	ServiceProviderGitlab                ServiceProviderType = "gitlab_hosted"
+	ServiceProviderGitlabCE              ServiceProviderType = "gitlab_community_edition"
+	ServiceProviderGitlabEE              ServiceProviderType = "gitlab_enterprise_edition"
 )
 
 // OAuthClientList represents a list of OAuth clients.
@@ -83,7 +88,7 @@ type OAuthClientListOptions struct {
 // List all the OAuth clients for a given organization.
 func (s *oAuthClients) List(ctx context.Context, organization string, options OAuthClientListOptions) (*OAuthClientList, error) {
 	if !validStringID(&organization) {
-		return nil, errors.New("invalid value for organization")
+		return nil, ErrInvalidOrg
 	}
 
 	u := fmt.Sprintf("organizations/%s/oauth-clients", url.QueryEscape(organization))
@@ -103,8 +108,11 @@ func (s *oAuthClients) List(ctx context.Context, organization string, options OA
 
 // OAuthClientCreateOptions represents the options for creating an OAuth client.
 type OAuthClientCreateOptions struct {
-	// For internal use only!
-	ID string `jsonapi:"primary,oauth-clients"`
+	// Type is a public field utilized by JSON:API to
+	// set the resource type via the field tag.
+	// It is not a user-defined value and does not need to be set.
+	// https://jsonapi.org/format/#crud-creating
+	Type string `jsonapi:"primary,oauth-clients"`
 
 	// The base URL of your VCS provider's API.
 	APIURL *string `jsonapi:"attr,api-url"`
@@ -114,6 +122,9 @@ type OAuthClientCreateOptions struct {
 
 	// The token string you were given by your VCS provider.
 	OAuthToken *string `jsonapi:"attr,oauth-token-string"`
+
+	// Private key associated with this vcs provider - only available for ado_server
+	PrivateKey *string `jsonapi:"attr,private-key"`
 
 	// The VCS provider being connected with.
 	ServiceProvider *ServiceProviderType `jsonapi:"attr,service-provider"`
@@ -132,20 +143,20 @@ func (o OAuthClientCreateOptions) valid() error {
 	if o.ServiceProvider == nil {
 		return errors.New("service provider is required")
 	}
+	if validString(o.PrivateKey) && *o.ServiceProvider != *ServiceProvider(ServiceProviderAzureDevOpsServer) {
+		return errors.New("private Key can only be present with Azure DevOps Server service provider")
+	}
 	return nil
 }
 
 // Create an OAuth client to connect an organization and a VCS provider.
 func (s *oAuthClients) Create(ctx context.Context, organization string, options OAuthClientCreateOptions) (*OAuthClient, error) {
 	if !validStringID(&organization) {
-		return nil, errors.New("invalid value for organization")
+		return nil, ErrInvalidOrg
 	}
 	if err := options.valid(); err != nil {
 		return nil, err
 	}
-
-	// Make sure we don't send a user provided ID.
-	options.ID = ""
 
 	u := fmt.Sprintf("organizations/%s/oauth-clients", url.QueryEscape(organization))
 	req, err := s.client.newRequest("POST", u, &options)
