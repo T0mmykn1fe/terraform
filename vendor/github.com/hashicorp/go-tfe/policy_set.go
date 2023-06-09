@@ -14,7 +14,7 @@ var _ PolicySets = (*policySets)(nil)
 // PolicySets describes all the policy set related methods that the Terraform
 // Enterprise API supports.
 //
-// TFE API docs: https://www.terraform.io/docs/enterprise/api/policies.html
+// TFE API docs: https://www.terraform.io/docs/cloud/api/policies.html
 type PolicySets interface {
 	// List all the policy sets for a given organization.
 	List(ctx context.Context, organization string, options PolicySetListOptions) (*PolicySetList, error)
@@ -25,13 +25,18 @@ type PolicySets interface {
 	// Read a policy set by its ID.
 	Read(ctx context.Context, policySetID string) (*PolicySet, error)
 
+	// ReadWithOptions reads a policy set by its ID using the options supplied.
+	ReadWithOptions(ctx context.Context, policySetID string, options *PolicySetReadOptions) (*PolicySet, error)
+
 	// Update an existing policy set.
 	Update(ctx context.Context, policySetID string, options PolicySetUpdateOptions) (*PolicySet, error)
 
-	// Add policies to a policy set.
+	// Add policies to a policy set. This function can only be used when
+	// there is no VCS repository associated with the policy set.
 	AddPolicies(ctx context.Context, policySetID string, options PolicySetAddPoliciesOptions) error
 
-	// Remove policies from a policy set.
+	// Remove policies from a policy set. This function can only be used
+	// when there is no VCS repository associated with the policy set.
 	RemovePolicies(ctx context.Context, policySetID string, options PolicySetRemovePoliciesOptions) error
 
 	// Add workspaces to a policy set.
@@ -61,15 +66,26 @@ type PolicySet struct {
 	Name           string    `jsonapi:"attr,name"`
 	Description    string    `jsonapi:"attr,description"`
 	Global         bool      `jsonapi:"attr,global"`
+	PoliciesPath   string    `jsonapi:"attr,policies-path"`
 	PolicyCount    int       `jsonapi:"attr,policy-count"`
+	VCSRepo        *VCSRepo  `jsonapi:"attr,vcs-repo"`
 	WorkspaceCount int       `jsonapi:"attr,workspace-count"`
 	CreatedAt      time.Time `jsonapi:"attr,created-at,iso8601"`
 	UpdatedAt      time.Time `jsonapi:"attr,updated-at,iso8601"`
 
 	// Relations
+	// The organization to which the policy set belongs to.
 	Organization *Organization `jsonapi:"relation,organization"`
-	Policies     []*Policy     `jsonapi:"relation,policies"`
-	Workspaces   []*Workspace  `jsonapi:"relation,workspaces"`
+	// The workspaces to which the policy set applies.
+	Workspaces []*Workspace `jsonapi:"relation,workspaces"`
+	// Individually managed policies which are associated with the policy set.
+	Policies []*Policy `jsonapi:"relation,policies"`
+	// The most recently created policy set version, regardless of status.
+	// Note that this relationship may include an errored and unusable version,
+	// and is intended to allow checking for errors.
+	NewestVersion *PolicySetVersion `jsonapi:"relation,newest-version"`
+	// The most recent successful policy set version.
+	CurrentVersion *PolicySetVersion `jsonapi:"relation,current-version"`
 }
 
 // PolicySetListOptions represents the options for listing policy sets.
@@ -83,7 +99,7 @@ type PolicySetListOptions struct {
 // List all the policies for a given organization.
 func (s *policySets) List(ctx context.Context, organization string, options PolicySetListOptions) (*PolicySetList, error) {
 	if !validStringID(&organization) {
-		return nil, errors.New("invalid value for organization")
+		return nil, ErrInvalidOrg
 	}
 
 	u := fmt.Sprintf("organizations/%s/policy-sets", url.QueryEscape(organization))
@@ -103,8 +119,11 @@ func (s *policySets) List(ctx context.Context, organization string, options Poli
 
 // PolicySetCreateOptions represents the options for creating a new policy set.
 type PolicySetCreateOptions struct {
-	// For internal use only!
-	ID string `jsonapi:"primary,policy-sets"`
+	// Type is a public field utilized by JSON:API to
+	// set the resource type via the field tag.
+	// It is not a user-defined value and does not need to be set.
+	// https://jsonapi.org/format/#crud-creating
+	Type string `jsonapi:"primary,policy-sets"`
 
 	// The name of the policy set.
 	Name *string `jsonapi:"attr,name"`
@@ -115,8 +134,20 @@ type PolicySetCreateOptions struct {
 	// Whether or not the policy set is global.
 	Global *bool `jsonapi:"attr,global,omitempty"`
 
+	// The sub-path within the attached VCS repository to ingress. All
+	// files and directories outside of this sub-path will be ignored.
+	// This option may only be specified when a VCS repo is present.
+	PoliciesPath *string `jsonapi:"attr,policies-path,omitempty"`
+
 	// The initial members of the policy set.
 	Policies []*Policy `jsonapi:"relation,policies,omitempty"`
+
+	// VCS repository information. When present, the policies and
+	// configuration will be sourced from the specified VCS repository
+	// instead of being defined within the policy set itself. Note that
+	// this option is mutually exclusive with the Policies option and
+	// both cannot be used at the same time.
+	VCSRepo *VCSRepoOptions `jsonapi:"attr,vcs-repo,omitempty"`
 
 	// The initial list of workspaces for which the policy set should be enforced.
 	Workspaces []*Workspace `jsonapi:"relation,workspaces,omitempty"`
@@ -124,10 +155,10 @@ type PolicySetCreateOptions struct {
 
 func (o PolicySetCreateOptions) valid() error {
 	if !validString(o.Name) {
-		return errors.New("name is required")
+		return ErrRequiredName
 	}
 	if !validStringID(o.Name) {
-		return errors.New("invalid value for name")
+		return ErrInvalidName
 	}
 	return nil
 }
@@ -135,14 +166,11 @@ func (o PolicySetCreateOptions) valid() error {
 // Create a policy set and associate it with an organization.
 func (s *policySets) Create(ctx context.Context, organization string, options PolicySetCreateOptions) (*PolicySet, error) {
 	if !validStringID(&organization) {
-		return nil, errors.New("invalid value for organization")
+		return nil, ErrInvalidOrg
 	}
 	if err := options.valid(); err != nil {
 		return nil, err
 	}
-
-	// Make sure we don't send a user provided ID.
-	options.ID = ""
 
 	u := fmt.Sprintf("organizations/%s/policy-sets", url.QueryEscape(organization))
 	req, err := s.client.newRequest("POST", u, &options)
@@ -159,14 +187,26 @@ func (s *policySets) Create(ctx context.Context, organization string, options Po
 	return ps, err
 }
 
+// PolicySetReadOptions are read options.
+// For a full list of relations, please see:
+// https://www.terraform.io/docs/cloud/api/policy-sets.html#relationships
+type PolicySetReadOptions struct {
+	Include string `url:"include"`
+}
+
 // Read a policy set by its ID.
 func (s *policySets) Read(ctx context.Context, policySetID string) (*PolicySet, error) {
+	return s.ReadWithOptions(ctx, policySetID, nil)
+}
+
+// ReadWithOptions reads a policy by its ID using the options supplied.
+func (s *policySets) ReadWithOptions(ctx context.Context, policySetID string, options *PolicySetReadOptions) (*PolicySet, error) {
 	if !validStringID(&policySetID) {
 		return nil, errors.New("invalid value for policy set ID")
 	}
 
 	u := fmt.Sprintf("policy-sets/%s", url.QueryEscape(policySetID))
-	req, err := s.client.newRequest("GET", u, nil)
+	req, err := s.client.newRequest("GET", u, options)
 	if err != nil {
 		return nil, err
 	}
@@ -182,8 +222,11 @@ func (s *policySets) Read(ctx context.Context, policySetID string) (*PolicySet, 
 
 // PolicySetUpdateOptions represents the options for updating a policy set.
 type PolicySetUpdateOptions struct {
-	// For internal use only!
-	ID string `jsonapi:"primary,policy-sets"`
+	// Type is a public field utilized by JSON:API to
+	// set the resource type via the field tag.
+	// It is not a user-defined value and does not need to be set.
+	// https://jsonapi.org/format/#crud-creating
+	Type string `jsonapi:"primary,policy-sets"`
 
 	/// The name of the policy set.
 	Name *string `jsonapi:"attr,name,omitempty"`
@@ -193,11 +236,24 @@ type PolicySetUpdateOptions struct {
 
 	// Whether or not the policy set is global.
 	Global *bool `jsonapi:"attr,global,omitempty"`
+
+	// The sub-path within the attached VCS repository to ingress. All
+	// files and directories outside of this sub-path will be ignored.
+	// This option may only be specified when a VCS repo is present.
+	PoliciesPath *string `jsonapi:"attr,policies-path,omitempty"`
+
+	// VCS repository information. When present, the policies and
+	// configuration will be sourced from the specified VCS repository
+	// instead of being defined within the policy set itself. Note that
+	// specifying this option may only be used on policy sets with no
+	// directly-attached policies (*PolicySet.Policies). Specifying this
+	// option when policies are already present will result in an error.
+	VCSRepo *VCSRepoOptions `jsonapi:"attr,vcs-repo,omitempty"`
 }
 
 func (o PolicySetUpdateOptions) valid() error {
 	if o.Name != nil && !validStringID(o.Name) {
-		return errors.New("invalid value for name")
+		return ErrInvalidName
 	}
 	return nil
 }
@@ -210,9 +266,6 @@ func (s *policySets) Update(ctx context.Context, policySetID string, options Pol
 	if err := options.valid(); err != nil {
 		return nil, err
 	}
-
-	// Make sure we don't send a user provided ID.
-	options.ID = ""
 
 	u := fmt.Sprintf("policy-sets/%s", url.QueryEscape(policySetID))
 	req, err := s.client.newRequest("PATCH", u, &options)

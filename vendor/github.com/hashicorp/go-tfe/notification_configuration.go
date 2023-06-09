@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"time"
 )
@@ -16,7 +15,7 @@ var _ NotificationConfigurations = (*notificationConfigurations)(nil)
 // related methods that the Terraform Enterprise API supports.
 //
 // TFE API docs:
-// https://www.terraform.io/docs/enterprise/api/notification-configurations.html
+// https://www.terraform.io/docs/cloud/api/notification-configurations.html
 type NotificationConfigurations interface {
 	// List all the notification configurations within a workspace.
 	List(ctx context.Context, workspaceID string, options NotificationConfigurationListOptions) (*NotificationConfigurationList, error)
@@ -58,8 +57,9 @@ type NotificationDestinationType string
 
 // List of available notification destination types.
 const (
-	NotificationDestinationTypeSlack   NotificationDestinationType = "slack"
+	NotificationDestinationTypeEmail   NotificationDestinationType = "email"
 	NotificationDestinationTypeGeneric NotificationDestinationType = "generic"
+	NotificationDestinationTypeSlack   NotificationDestinationType = "slack"
 )
 
 // NotificationConfigurationList represents a list of Notification
@@ -81,16 +81,23 @@ type NotificationConfiguration struct {
 	Triggers          []string                    `jsonapi:"attr,triggers"`
 	UpdatedAt         time.Time                   `jsonapi:"attr,updated-at,iso8601"`
 	URL               string                      `jsonapi:"attr,url"`
+
+	// EmailAddresses is only available for TFE users. It is not available in TFC.
+	EmailAddresses []string `jsonapi:"attr,email-addresses"`
+
+	// Relations
+	Subscribable *Workspace `jsonapi:"relation,subscribable"`
+	EmailUsers   []*User    `jsonapi:"relation,users"`
 }
 
 // DeliveryResponse represents a notification configuration delivery response.
 type DeliveryResponse struct {
-	Body       string      `json:"body"`
-	Code       int         `json:"code"`
-	Headers    http.Header `json:"headers"`
-	SentAt     time.Time   `json:"sent-at,iso8601"`
-	Successful bool        `json:"successful"`
-	URL        string      `json:"url"`
+	Body       string              `jsonapi:"attr,body"`
+	Code       string              `jsonapi:"attr,code"`
+	Headers    map[string][]string `jsonapi:"attr,headers"`
+	SentAt     time.Time           `jsonapi:"attr,sent-at,rfc3339"`
+	Successful string              `jsonapi:"attr,successful"`
+	URL        string              `jsonapi:"attr,url"`
 }
 
 // NotificationConfigurationListOptions represents the options for listing
@@ -102,7 +109,7 @@ type NotificationConfigurationListOptions struct {
 // List all the notification configurations associated with a workspace.
 func (s *notificationConfigurations) List(ctx context.Context, workspaceID string, options NotificationConfigurationListOptions) (*NotificationConfigurationList, error) {
 	if !validStringID(&workspaceID) {
-		return nil, errors.New("invalid value for workspace ID")
+		return nil, ErrInvalidWorkspaceID
 	}
 
 	u := fmt.Sprintf("workspaces/%s/notification-configurations", url.QueryEscape(workspaceID))
@@ -123,8 +130,11 @@ func (s *notificationConfigurations) List(ctx context.Context, workspaceID strin
 // NotificationConfigurationCreateOptions represents the options for
 // creating a new notification configuration.
 type NotificationConfigurationCreateOptions struct {
-	// For internal use only!
-	ID string `jsonapi:"primary,notification-configurations"`
+	// Type is a public field utilized by JSON:API to
+	// set the resource type via the field tag.
+	// It is not a user-defined value and does not need to be set.
+	// https://jsonapi.org/format/#crud-creating
+	Type string `jsonapi:"primary,notification-configurations"`
 
 	// The destination type of the notification configuration
 	DestinationType *NotificationDestinationType `jsonapi:"attr,destination-type"`
@@ -138,11 +148,18 @@ type NotificationConfigurationCreateOptions struct {
 	// The token of the notification configuration
 	Token *string `jsonapi:"attr,token,omitempty"`
 
-	// The destination type of the notification configuration
+	// The list of run events that will trigger notifications.
 	Triggers []string `jsonapi:"attr,triggers,omitempty"`
 
 	// The url of the notification configuration
-	URL *string `jsonapi:"attr,url"`
+	URL *string `jsonapi:"attr,url,omitempty"`
+
+	// The list of email addresses that will receive notification emails.
+	// EmailAddresses is only available for TFE users. It is not available in TFC.
+	EmailAddresses []string `jsonapi:"attr,email-addresses,omitempty"`
+
+	// The list of users belonging to the organization that will receive notification emails.
+	EmailUsers []*User `jsonapi:"relation,users,omitempty"`
 }
 
 func (o NotificationConfigurationCreateOptions) valid() error {
@@ -153,10 +170,13 @@ func (o NotificationConfigurationCreateOptions) valid() error {
 		return errors.New("enabled is required")
 	}
 	if !validString(o.Name) {
-		return errors.New("name is required")
+		return ErrRequiredName
 	}
-	if !validString(o.URL) {
-		return errors.New("url is required")
+
+	if *o.DestinationType == NotificationDestinationTypeGeneric || *o.DestinationType == NotificationDestinationTypeSlack {
+		if o.URL == nil {
+			return errors.New("url is required")
+		}
 	}
 	return nil
 }
@@ -164,14 +184,11 @@ func (o NotificationConfigurationCreateOptions) valid() error {
 // Creates a notification configuration with the given options.
 func (s *notificationConfigurations) Create(ctx context.Context, workspaceID string, options NotificationConfigurationCreateOptions) (*NotificationConfiguration, error) {
 	if !validStringID(&workspaceID) {
-		return nil, errors.New("invalid value for workspace ID")
+		return nil, ErrInvalidWorkspaceID
 	}
 	if err := options.valid(); err != nil {
 		return nil, err
 	}
-
-	// Make sure we don't send a user provided ID.
-	options.ID = ""
 
 	u := fmt.Sprintf("workspaces/%s/notification-configurations", url.QueryEscape(workspaceID))
 	req, err := s.client.newRequest("POST", u, &options)
@@ -188,7 +205,7 @@ func (s *notificationConfigurations) Create(ctx context.Context, workspaceID str
 	return nc, nil
 }
 
-// Read a notitification configuration by its ID.
+// Read a notification configuration by its ID.
 func (s *notificationConfigurations) Read(ctx context.Context, notificationConfigurationID string) (*NotificationConfiguration, error) {
 	if !validStringID(&notificationConfigurationID) {
 		return nil, errors.New("invalid value for notification configuration ID")
@@ -212,8 +229,11 @@ func (s *notificationConfigurations) Read(ctx context.Context, notificationConfi
 // NotificationConfigurationUpdateOptions represents the options for
 // updating a existing notification configuration.
 type NotificationConfigurationUpdateOptions struct {
-	// For internal use only!
-	ID string `jsonapi:"primary,notification-configurations"`
+	// Type is a public field utilized by JSON:API to
+	// set the resource type via the field tag.
+	// It is not a user-defined value and does not need to be set.
+	// https://jsonapi.org/format/#crud-creating
+	Type string `jsonapi:"primary,notification-configurations"`
 
 	// Whether the notification configuration should be enabled or not
 	Enabled *bool `jsonapi:"attr,enabled,omitempty"`
@@ -224,11 +244,18 @@ type NotificationConfigurationUpdateOptions struct {
 	// The token of the notification configuration
 	Token *string `jsonapi:"attr,token,omitempty"`
 
-	// The destination type of the notification configuration
+	// The list of run events that will trigger notifications.
 	Triggers []string `jsonapi:"attr,triggers,omitempty"`
 
 	// The url of the notification configuration
 	URL *string `jsonapi:"attr,url,omitempty"`
+
+	// The list of email addresses that will receive notification emails.
+	// EmailAddresses is only available for TFE users. It is not available in TFC.
+	EmailAddresses []string `jsonapi:"attr,email-addresses,omitempty"`
+
+	// The list of users belonging to the organization that will receive notification emails.
+	EmailUsers []*User `jsonapi:"relation,users,omitempty"`
 }
 
 // Updates a notification configuration with the given options.
@@ -236,9 +263,6 @@ func (s *notificationConfigurations) Update(ctx context.Context, notificationCon
 	if !validStringID(&notificationConfigurationID) {
 		return nil, errors.New("invalid value for notification configuration ID")
 	}
-
-	// Make sure we don't send a user provided ID.
-	options.ID = ""
 
 	u := fmt.Sprintf("notification-configurations/%s", url.QueryEscape(notificationConfigurationID))
 	req, err := s.client.newRequest("PATCH", u, &options)
