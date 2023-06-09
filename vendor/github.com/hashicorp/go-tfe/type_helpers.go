@@ -5,6 +5,26 @@ func Access(v AccessType) *AccessType {
 	return &v
 }
 
+// RunsPermission returns a pointer to the given team runs permission type.
+func RunsPermission(v RunsPermissionType) *RunsPermissionType {
+	return &v
+}
+
+// VariablesPermission returns a pointer to the given team variables permission type.
+func VariablesPermission(v VariablesPermissionType) *VariablesPermissionType {
+	return &v
+}
+
+// StateVersionsPermission returns a pointer to the given team state versions permission type.
+func StateVersionsPermission(v StateVersionsPermissionType) *StateVersionsPermissionType {
+	return &v
+}
+
+// SentinelMocksPermission returns a pointer to the given team Sentinel mocks permission type.
+func SentinelMocksPermission(v SentinelMocksPermissionType) *SentinelMocksPermissionType {
+	return &v
+}
+
 // AuthPolicy returns a pointer to the given authentication poliy.
 func AuthPolicy(v AuthPolicyType) *AuthPolicyType {
 	return &v
@@ -40,8 +60,18 @@ func NotificationDestination(v NotificationDestinationType) *NotificationDestina
 	return &v
 }
 
+// PlanExportType returns a pointer to the given plan export data type.
+func PlanExportType(v PlanExportDataType) *PlanExportDataType {
+	return &v
+}
+
 // ServiceProvider returns a pointer to the given service provider type.
 func ServiceProvider(v ServiceProviderType) *ServiceProviderType {
+	return &v
+}
+
+// SMTPAuthValue returns a pointer to a given smtp auth type.
+func SMTPAuthValue(v SMTPAuthType) *SMTPAuthType {
 	return &v
 }
 
